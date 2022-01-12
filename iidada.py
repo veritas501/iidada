@@ -12,7 +12,9 @@ import copy
 import marshal
 import os
 
+import ida_auto
 import ida_bytes
+import ida_entry
 import ida_funcs
 import ida_ida
 import ida_kernwin
@@ -24,6 +26,39 @@ import idaapi
 import idautils
 import idc
 from ida_idaapi import BADADDR
+
+DEBUG_MODE = False
+
+
+def debug_print(s):
+    if DEBUG_MODE:
+        print(s)
+
+
+def remove_prefix(s, prefix):
+    if s.startswith(prefix):
+        return s[len(prefix):]
+    return s
+
+
+def get_segm_ori_name(seg):
+    name = ida_segment.get_segm_name(seg)
+    name_list = name.split(':')
+    if len(name_list) == 1:
+        return name
+    else:
+        return ':'.join(name_list[1:])
+
+
+def get_segments_by_name(name):
+    segments = []
+    seg_cnt = ida_segment.get_segm_qty()
+    for i in range(seg_cnt):
+        seg = ida_segment.getnseg(i)
+        if get_segm_ori_name(seg) == name:
+            ida_segment.lock_segm(seg, True)
+            segments.append(seg)
+    return segments
 
 
 def is_elf():
@@ -38,31 +73,46 @@ def elf_get_external_function():
             tmp_ref_ea = ida_xref.get_next_dref_to(ea, first_ref_ea)
         if tmp_ref_ea == BADADDR:
             return None
-        if got_seg.start_ea <= tmp_ref_ea < got_seg.end_ea:
+        segm_ori_name = get_segm_ori_name(ida_segment.getseg(tmp_ref_ea))
+        if segm_ori_name in ['.got', '.got.plt']:
             return tmp_ref_ea
-        return get_xref_in_got(target_ea, tmp_ref_ea)
+        return get_xref_in_got(target_ea, tmp_ref_ea)  # find next ref
 
-    # get extern segment
-    extern_seg = ida_segment.get_segm_by_name('extern')
-    if not extern_seg:
+    def get_extern_name(_ea):
+        _name = idc.get_func_name(_ea)
+        # try to remove __imp_ prefix
+        _name = remove_prefix(_name, '__imp_')
+        # try to remove numerical suffix
+        last_underscore = _name.rfind('_')
+        if last_underscore != -1 and _name[last_underscore + 1:].isdecimal():
+            _name = _name[:last_underscore]
+        return _name
+
+    # get all extern segments
+    extern_segments = get_segments_by_name('extern')
+    if not extern_segments:
         print("[-] can't find extern segment")
         return None
 
-    # get GOT segment
-    got_seg = ida_segment.get_segm_by_name('.got')
-    if not got_seg:
-        print("[-] can't find .GOT segment")
-        return None
-
-    # get extern functions
-    extern_func_ea = idautils.Functions(
-        extern_seg.start_ea,
-        extern_seg.end_ea + 1
-    )
     extern_functions = dict()  # func_name: got_ea
-    for ea in extern_func_ea:
-        if ref_ea := get_xref_in_got(ea):
-            extern_functions[idc.get_func_name(ea)] = ref_ea
+    for extern_seg in extern_segments:
+        debug_print("[*] extern segment: {}".format(
+            hex(extern_seg.start_ea)
+        ))
+        # get extern functions
+        extern_func_ea = idautils.Functions(
+            extern_seg.start_ea,
+            extern_seg.end_ea + 1
+        )
+        for ea in extern_func_ea:
+            debug_print("[*] extern function: {}".format(
+                hex(ea)
+            ))
+            if ref_ea := get_xref_in_got(ea):
+                debug_print("[*] find extern symbol `{}` @ {}".format(
+                    get_extern_name(ea), hex(ref_ea)
+                ))
+                extern_functions[ref_ea] = get_extern_name(ea)
 
     return extern_functions
 
@@ -87,6 +137,7 @@ class IDASegInfo:
         self.seg_comb = 0
         self.seg_flags = 0
         self.seg_para = 0
+        self.seg_type = 0
 
         self._seg_data = None
 
@@ -110,6 +161,8 @@ class IDASegInfo:
             self.seg_flags = val
         if val := kwargs.get('seg_para'):
             self.seg_para = val
+        if val := kwargs.get('seg_type'):
+            self.seg_type = val
 
     @property
     def seg_data(self):
@@ -131,6 +184,7 @@ class IDASegInfo:
             'seg_comb': self.seg_comb,
             'seg_flags': self.seg_flags,
             'seg_para': self.seg_para,
+            'seg_type': self.seg_type,
             'seg_data': self._seg_data,
         })
 
@@ -140,19 +194,6 @@ class IDASegInfo:
         ida_segment_info = IDASegInfo(**datas)
         ida_segment_info.seg_data = datas.get('seg_data')
         return ida_segment_info
-
-    # noinspection PyPropertyAccess
-    def build_ida_segment(self):
-        ida_seg = ida_segment.segment_t()
-        ida_segment.set_segm_name(ida_seg, self.seg_name)
-        ida_segment.set_segm_class(ida_seg, self.seg_class)
-        ida_segment.set_segm_start(ida_seg, self.seg_start_ea)
-        ida_segment.set_segm_end(ida_seg, self.seg_end_ea)
-        ida_seg.align = self.seg_align
-        ida_seg.perm = self.seg_perm
-        ida_seg.comb = self.seg_comb
-        ida_seg.flags = self.seg_flags
-        return ida_seg
 
 
 def dump_segments():
@@ -176,6 +217,7 @@ def dump_segments():
         seg_comb = seg.comb
         seg_flags = seg.flags
         seg_para = ida_segment.get_segm_para(seg)
+        seg_type = seg.type
         seg_size = seg_end_ea - seg_start_ea
         if seg_size > 0:
             seg_first_bit_loaded = ida_bytes.is_loaded(seg_start_ea)
@@ -197,6 +239,7 @@ def dump_segments():
             seg_comb=seg_comb,
             seg_flags=seg_flags,
             seg_para=seg_para,
+            seg_type=seg_type,
         )
         ida_segment_info.seg_data = seg_data
         dump_seg_info = ida_segment_info.dumps()
@@ -215,13 +258,50 @@ def dump_names():
     return names
 
 
-def dump_functions():
-    return list(idautils.Functions())
+def dump_functions(start=None, end=None):
+    # copied from idautils.Functions
+    if start is None:
+        start = ida_ida.cvar.inf.min_ea
+        end = ida_ida.cvar.inf.max_ea
+
+    # find first function head chunk in the range
+    chunk = ida_funcs.get_fchunk(start)
+    if not chunk:
+        chunk = ida_funcs.get_next_fchunk(start)
+    while chunk and chunk.start_ea < end and \
+            (chunk.flags & ida_funcs.FUNC_TAIL) != 0:
+        chunk = ida_funcs.get_next_fchunk(chunk.start_ea)
+    func = chunk
+
+    func_list = list()
+    while func and func.start_ea < end:
+        start_ea = func.start_ea
+        end_ea = func.end_ea
+        func_list.append((start_ea, end_ea))
+        func = ida_funcs.get_next_func(start_ea)
+    return func_list
+
+
+def dump_export_table():
+    cnt = ida_entry.get_entry_qty()
+    export_table = dict()
+    for i in range(cnt):
+        ordinal = ida_entry.get_entry_ordinal(i)
+        ea = ida_entry.get_entry(ordinal)
+        name = ida_entry.get_entry_name(ordinal)
+        export_table[name] = ea
+    return export_table
 
 
 def load_segments(segments, root_filename):
+    ida_auto.auto_wait()
     for seg in segments:
         ida_segment_info = IDASegInfo.loads(seg)
+        debug_print('[*] try to add segment `{}` @ [{}, {}]'.format(
+            root_filename + ':' + ida_segment_info.seg_name,
+            hex(ida_segment_info.seg_start_ea),
+            hex(ida_segment_info.seg_end_ea),
+        ))
         ans = ida_segment.add_segm(
             0,
             ida_segment_info.seg_start_ea,
@@ -239,8 +319,10 @@ def load_segments(segments, root_filename):
         ida_seg = ida_segment.getseg(ida_segment_info.seg_start_ea)
         ida_seg.align = ida_segment_info.seg_align
         ida_seg.perm = ida_segment_info.seg_perm
+        ida_seg.comb = ida_segment_info.seg_comb
         ida_seg.bitness = ida_segment_info.seg_bits
         ida_seg.flags = ida_segment_info.seg_flags
+        ida_seg.type = ida_segment_info.seg_type
         if ida_segment_info.seg_data:
             ida_bytes.put_bytes(
                 ida_segment_info.seg_start_ea,
@@ -250,7 +332,9 @@ def load_segments(segments, root_filename):
 
 
 def load_names(names):
+    ida_auto.auto_wait()
     for address, name in names:
+        debug_print("[*] add name `{}` @ {}".format(name, hex(address), ))
         ans = ida_name.set_name(
             address, name,
             ida_name.SN_FORCE | ida_name.SN_NOWARN
@@ -263,15 +347,34 @@ def load_names(names):
 
 
 def load_functions(functions):
-    for func_ea in functions:
-        ida_funcs.add_func(func_ea)
+    ida_auto.auto_wait()
+    for start_ea, end_ea in functions:
+        debug_print("[*] add func: {} - {}".format(hex(start_ea), hex(end_ea)))
+        if not ida_funcs.add_func(start_ea):
+            print("[-] add function failed: {} - {}".format(
+                hex(start_ea), hex(end_ea)
+            ))
+            continue
+        this_func = ida_funcs.get_func(start_ea)
+        if this_func.end_ea == end_ea:
+            continue
+        elif this_func.end_ea > end_ea:
+            ida_funcs.set_func_end(start_ea, end_ea)
+        else:
+            funcs = dump_functions(start_ea, end_ea)[1:]
+            for func, _ in funcs:
+                ida_funcs.del_func(func)
+            ida_funcs.set_func_end(start_ea, end_ea)
 
 
-def fix_elf_got(names):
-    names_dict = {name: address for address, name in names}
+def fix_elf_got(export_tbl):
+    ida_auto.auto_wait()
     ext_functions = elf_get_external_function()
-    for name, got_ea in ext_functions.items():
-        if address := names_dict.get(name):
+    for got_ea, name in ext_functions.items():
+        if address := export_tbl.get(name):
+            debug_print("[*] patch got `{}` @ {} to {}".format(
+                name, hex(got_ea), hex(address)
+            ))
             ida_bytes.patch_qword(got_ea, address)
             # some magic, so plt disassemble correctly
             ida_bytes.op_hex(got_ea, -1)
@@ -287,11 +390,13 @@ def dump_all(fname):
     segments = dump_segments()
     names = dump_names()
     functions = dump_functions()
+    export_table = dump_export_table()
     dump_data = marshal.dumps({
         'segment': segments,
         'name': names,
         'function': functions,
         'root_filename': root_filename,
+        'export_table': export_table,
     })
     with open(fname, 'wb') as fp:
         fp.write(dump_data)
@@ -309,9 +414,10 @@ def load_all(dump_file):
         load_names(names)
     if functions := dump_data.get('function'):
         load_functions(functions)
-    if is_elf():
-        # try to fix got table
-        fix_elf_got(names)
+    if export_table := dump_data.get('export_table'):
+        if is_elf():
+            # try to fix got table
+            fix_elf_got(export_table)
     return True
 
 
@@ -321,18 +427,18 @@ def iidada_produce():
         if not fname.endswith('.iidada'):
             fname += ".iidada"
         if dump_all(fname):
-            print("[+] IIDADA produce database success")
+            print("[+] IIDADA produce database success. {}".format(fname))
         else:
-            print("[-] IIDADA produce database failed")
+            print("[-] IIDADA produce database failed. {}".format(fname))
 
 
 def iidada_load():
     fname = ida_kernwin.ask_file(0, "*.iidada", "Load database file")
     if fname:
         if load_all(fname):
-            print("[+] IIDADA merge database success")
+            print("[+] IIDADA merge database success. {}".format(fname))
         else:
-            print("[-] IIDADA merge database failed")
+            print("[-] IIDADA merge database failed. {}".format(fname))
 
 
 class ProduceIIDADAAction(idaapi.action_handler_t):
@@ -421,3 +527,12 @@ class IIDADAPlugin(idaapi.plugin_t):
 # noinspection PyPep8Naming
 def PLUGIN_ENTRY():
     return IIDADAPlugin()
+
+
+def test():
+    load_all("add.iidada")
+    load_all("log.iidada")
+
+
+if __name__ == '__main__':
+    test()
