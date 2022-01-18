@@ -2,6 +2,7 @@
 
 import ida_auto
 import ida_bytes
+import ida_name
 import ida_segment
 import ida_xref
 import idautils
@@ -76,7 +77,8 @@ def fix_elf_got(export_tbl):
             ))
             ida_bytes.patch_qword(got_ea, address)
             # some magic, so plt disassemble correctly
-            ida_bytes.op_hex(got_ea, -1)
+            true_name = ida_name.get_ea_name(address)
+            ida_bytes.set_forced_operand(got_ea, 0, true_name)
             ida_bytes.set_cmt(
                 got_ea,
                 "Patched by iidada, DON'T change it to `offset` type",
